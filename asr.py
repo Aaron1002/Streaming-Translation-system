@@ -1,205 +1,225 @@
-import os
 import queue
+import threading
+import asyncio
+import subprocess
 from time import time
 
 import numpy as np
 import sounddevice as sd
-from dotenv import load_dotenv
 from faster_whisper import WhisperModel
-from google import genai
-
-import asyncio
 import websockets
+
 # ======================================================
-# 基本設定
+# Audio Input
 # ======================================================
 
-connected_clients = set()
+class AudioInput:
+    def __init__(
+        self,
+        device_id: int,
+        input_sr: int = 48000,
+        target_sr: int = 16000,
+        chunk_seconds: float = 2.5,
+        gain: float = 3.5,
+        rms_threshold: float = 0.005,
+    ):
+        self.device_id = device_id
+        self.input_sr = input_sr
+        self.target_sr = target_sr
+        self.chunk_seconds = chunk_seconds
+        self.block_size = int(input_sr * chunk_seconds)
+        self.gain = gain
+        self.rms_threshold = rms_threshold
+        self.queue = queue.Queue()
 
-async def ws_handler(websocket):
-    connected_clients.add(websocket)
-    try:
-        await websocket.wait_closed()
-    finally:
-        connected_clients.remove(websocket)
+    def _callback(self, indata, frames, time_info, status):
+        if status:
+            print("Audio status:", status)
 
-async def start_ws_server():
-    async with websockets.serve(ws_handler, "localhost", 8765):
-        await asyncio.Future()  # run forever
+        audio = indata[:, 0]
+        audio = np.clip(audio * self.gain, -1.0, 1.0)
+        self.queue.put(audio.copy())
 
-async def broadcast_subtitle(text):
-    if connected_clients:
-        await asyncio.gather(
-            *[client.send(text) for client in connected_clients]
+    def start(self):
+        return sd.InputStream(
+            device=self.device_id,
+            samplerate=self.input_sr,
+            channels=1,
+            dtype="float32",
+            blocksize=self.block_size,
+            callback=self._callback,
         )
 
+    def get_chunk(self):
+        audio = self.queue.get()
+        audio = self._resample(audio)
 
-load_dotenv()
+        rms = np.sqrt(np.mean(audio ** 2))
+        if rms < self.rms_threshold:
+            return None
 
-# Gemini client（新版 SDK）
-client = genai.Client(
-    api_key=os.getenv("GEMINI_API_KEY")
-)
+        return audio
 
-# Whisper 模型（即時字幕建議 small）
-whisper_model = WhisperModel(
-    "small",
-    device="cpu",        # 有 GPU 可改 "cuda"
-    compute_type="int8"  # CPU 省資源
-)
+    def _resample(self, audio):
+        if self.input_sr == self.target_sr:
+            return audio
 
-# Audio 設定
-SAMPLE_RATE = 16000
-CHUNK_SECONDS = 1.5
-BLOCK_SIZE = int(SAMPLE_RATE * CHUNK_SECONDS)
+        ratio = self.target_sr / self.input_sr
+        new_len = int(len(audio) * ratio)
 
-audio_queue = queue.Queue()
-
-# ======================================================
-# Step 1：短句過濾
-# ======================================================
-
-MIN_KO_LENGTH = 6   # 少於 6 字的韓文不翻
+        return np.interp(
+            np.linspace(0, len(audio), new_len, endpoint=False),
+            np.arange(len(audio)),
+            audio
+        ).astype(np.float32)
 
 # ======================================================
-# Step 2：重複句去重
+# Whisper ASR
 # ======================================================
 
-# last_ko_text = ""
+class WhisperASR:
+    def __init__(self):
+        self.model = WhisperModel(
+            "small",
+            device="cpu",
+            compute_type="int8"
+        )
+
+    def transcribe(self, audio_chunk):
+        segments, _ = self.model.transcribe(
+            audio_chunk,
+            language="ko",
+            vad_filter=True,
+            vad_parameters=dict(min_silence_duration_ms=300)
+        )
+        return [seg.text.strip() for seg in segments if seg.text.strip()]
 
 # ======================================================
-# Step 3：多段合併（節流）
+# Ollama Translator (CLI)
 # ======================================================
 
-# ko_buffer = []
-# last_flush_time = time()
-FLUSH_INTERVAL = 1.2
+class OllamaTranslator:
+    def __init__(self, model: str):
+        self.model = model
+        self.cache = {}
+
+    def translate(self, text: str) -> str:
+        if text in self.cache:
+            return self.cache[text]
+
+        prompt = (
+            "你是一個即時字幕翻譯引擎。\n"
+            "請將下面的韓文翻譯成自然、口語、繁體中文。\n"
+            "只輸出翻譯結果，不要解釋。\n\n"
+            f"韓文：{text}\n"
+            "繁體中文："
+        )
+
+        proc = subprocess.Popen(
+            ["ollama", "run", self.model],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="ignore"
+        )
+
+        stdout, stderr = proc.communicate(prompt, timeout=120)
+
+        if proc.returncode != 0:
+            raise RuntimeError(stderr.strip())
+
+        result = stdout.strip()
+        if not result:
+            raise RuntimeError("Ollama 沒有輸出任何內容")
+
+        self.cache[text] = result
+        return result
 
 # ======================================================
-# Step 4：翻譯結果快取
+# WebSocket Subtitle Server
 # ======================================================
 
-# translation_cache = {}
+class SubtitleServer:
+    def __init__(self, host="localhost", port=8765):
+        self.host = host
+        self.port = port
+        self.clients = set()
 
-# ======================================================
-# Audio callback
-# ======================================================
+    async def _handler(self, websocket):
+        self.clients.add(websocket)
+        try:
+            await websocket.wait_closed()
+        finally:
+            self.clients.remove(websocket)
 
-def audio_callback(indata, frames, time_info, status):
-    if status:
-        print("Audio status:", status)
-    audio_queue.put(indata.copy())
+    async def start(self):
+        async with websockets.serve(self._handler, self.host, self.port):
+            await asyncio.Future()
 
-# ======================================================
-# Gemini 翻譯函式
-# ======================================================
-
-def translate_ko_to_zh(text: str) -> str:
-    prompt = f"""
-你是一個即時直播字幕翻譯引擎。
-請將下面的韓文翻譯成「自然、口語、繁體中文」。
-只輸出翻譯結果，不要解釋。
-
-韓文：
-{text}
-
-繁體中文：
-"""
-    response = client.models.generate_content(
-        model="models/gemini-2.5-flash",
-        contents=prompt,
-    )
-    return response.text.strip()
-
-# ======================================================
-# 主流程
-# ======================================================
-def main():
-    print("🎧 開始監聽聲音（Ctrl+C 結束）...")
-
-    ko_buffer = []
-    last_flush_time = time()
-    last_ko_text = ""
-    translation_cache = {}
-
-    with sd.InputStream(
-        samplerate=SAMPLE_RATE,
-        channels=1,
-        dtype="float32",
-        blocksize=BLOCK_SIZE,
-        callback=audio_callback,
-    ):
-        while True:
-            audio_chunk = audio_queue.get()
-            audio_chunk = audio_chunk.flatten()
-
-            # Whisper ASR
-            segments, _ = whisper_model.transcribe(
-                audio_chunk,
-                language="ko"
+    async def broadcast(self, text: str):
+        if self.clients:
+            await asyncio.gather(
+                *[client.send(text) for client in self.clients]
             )
 
-            for seg in segments:
-                ko_text = seg.text.strip()
-                if not ko_text:
+# ======================================================
+# ASR Pipeline（主控）
+# ======================================================
+
+class ASRPipeline:
+    def __init__(self):
+        self.audio = AudioInput(device_id=17)
+        self.asr = WhisperASR()
+        self.translator = OllamaTranslator("qwen2.5:7b")
+        self.subtitle_server = SubtitleServer()
+
+        self.ko_buffer = []
+        self.last_flush_time = time()
+        self.last_ko_text = ""
+
+    def start(self):
+        threading.Thread(
+            target=lambda: asyncio.run(self.subtitle_server.start()),
+            daemon=True
+        ).start()
+
+        print("🎧 開始監聽聲音（Ctrl+C 結束）...")
+
+        with self.audio.start():
+            while True:
+                audio_chunk = self.audio.get_chunk()
+                if audio_chunk is None:
                     continue
 
-                # --------------------------------------------------
-                # Step 1：短句過濾
-                # --------------------------------------------------
-                if len(ko_text) < MIN_KO_LENGTH:
-                    continue
+                texts = self.asr.transcribe(audio_chunk)
+                for text in texts:
+                    if len(text) < 6 or text == self.last_ko_text:
+                        continue
+                    self.last_ko_text = text
+                    self.ko_buffer.append(text)
 
-                # --------------------------------------------------
-                # Step 2：重複句去重
-                # --------------------------------------------------
-                if ko_text == last_ko_text:
-                    continue
-                last_ko_text = ko_text
+                now = time()
+                if self.ko_buffer and now - self.last_flush_time >= 1.2:
+                    merged = " ".join(self.ko_buffer)
+                    self.ko_buffer.clear()
+                    self.last_flush_time = now
 
-                # --------------------------------------------------
-                # Step 3：累積到 buffer
-                # --------------------------------------------------
-                ko_buffer.append(ko_text)
+                    print(f"🇰🇷 {merged}")
 
-            # --------------------------------------------------
-            # Step 3：定時 flush buffer
-            # --------------------------------------------------
-            now = time()
-            if ko_buffer and (now - last_flush_time >= FLUSH_INTERVAL):
-                merged_text = " ".join(ko_buffer)
-                ko_buffer.clear()
-                last_flush_time = now
-
-                if len(merged_text) < MIN_KO_LENGTH:
-                    continue
-
-                print(f"🇰🇷 {merged_text}")
-
-                # --------------------------------------------------
-                # Step 4：翻譯快取
-                # --------------------------------------------------
-                if merged_text in translation_cache:
-                    zh_text = translation_cache[merged_text]
-                else:
                     try:
-                        zh_text = translate_ko_to_zh(merged_text)
-                        translation_cache[merged_text] = zh_text
+                        zh = self.translator.translate(merged)
                     except Exception as e:
                         print("⚠️ 翻譯失敗：", e)
                         continue
 
-                print(f"🇹🇼 {zh_text}\n")
-                asyncio.run(broadcast_subtitle(zh_text))
+                    print(f"🇹🇼 {zh}\n")
+                    asyncio.run(self.subtitle_server.broadcast(zh))
+
+# ======================================================
+# Entry Point
+# ======================================================
 
 if __name__ == "__main__":
-    import threading
-
-    # 啟動 WebSocket Server（背景）
-    threading.Thread(
-        target=lambda: asyncio.run(start_ws_server()),
-        daemon=True
-    ).start()
-
-    # 啟動主流程
-    main()
+    ASRPipeline().start()
